@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fischer Chess AI</title>
+    <!-- Chessboard.js CSS -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/chessboard-js/1.0.0/chessboard-1.0.0.css">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f0f0;
+        }
+        .container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        #game-status {
+            margin-top: 20px;
+            font-size: 18px;
+        }
+        #move-history {
+            margin-top: 20px;
+            width: 400px;
+            height: 150px;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+            padding: 10px;
+            background-color: #fff;
+        }
+        #ai-suggestions {
+            margin-top: 20px;
+            width: 400px;
+            padding: 10px;
+            background-color: #fff;
+            border: 1px solid #ccc;
+        }
+        .buttons {
+            margin-top: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 0 10px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div id="board" style="width: 400px"></div>
+        <div id="game-status">Your Turn</div>
+        <div id="move-history"></div>
+        <div id="ai-suggestions"></div>
+        <div class="buttons">
+            <button id="new-game">New Game</button>
+            <button id="flip-board">Flip Board</button>
+        </div>
+    </div>
+
+    <!-- jQuery (required by chessboard.js) -->
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <!-- Chess.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.2/chess.min.js"></script>
+    <!-- Chessboard.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chessboard-js/1.0.0/chessboard-1.0.0.min.js"></script>
+    <!-- ONNX Runtime Web -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.9.0/dist/ort.min.js"></script>
+
+    <script>
+        // Initialize chessboard and game
+        let board;
+        let game = new Chess();
+        let playerColor = 'w'; // Player plays as white by default
+        let moveHistory = [];
+        let gameOver = false;
+        let gameResult = null;
+
+        // Vocabulary mappings from JSON files
+        let moveToIdx = {};
+        let idxToMove = {};
+
+        // Load vocabulary mappings
+        Promise.all([
+            fetch('move_to_idx.json').then(res => res.json()),
+            fetch('idx_to_move.json').then(res => res.json())
+        ]).then(([moveToIdxData, idxToMoveData]) => {
+            moveToIdx = moveToIdxData;
+            idxToMove = idxToMoveData;
+            initializeOnnxSession();
+        }).catch(err => console.error('Error loading vocabulary:', err));
+
+        // ONNX session
+        let session;
+
+        async function initializeOnnxSession() {
+            try {
+                session = await ort.InferenceSession.create('./fischer_chess_ai.onnx');
+                console.log('ONNX model loaded successfully');
+                if (playerColor === 'b') {
+                    makeAIMove();
+                }
+            } catch (error) {
+                console.error('Error loading ONNX model:', error);
+            }
+        }
+
+        // Chessboard configuration
+        const cfg = {
+            draggable: true,
+            position: 'start',
+            onDragStart: onDragStart,
+            onDrop: onDrop,
+            onSnapEnd: onSnapEnd,
+            orientation: playerColor === 'w' ? 'white' : 'black'
+        };
+        board = Chessboard('board', cfg);
+
+        // Event handlers
+        function onDragStart(source, piece) {
+            if (gameOver || game.turn() !== playerColor) return false;
+            if ((playerColor === 'w' && piece.search(/^b/) !== -1) ||
+                (playerColor === 'b' && piece.search(/^w/) !== -1)) {
+                return false;
+            }
+        }
+
+        function onDrop(source, target) {
+            const move = game.move({
+                from: source,
+                to: target,
+                promotion: 'q' // Promote to queen for simplicity
+            });
+
+            if (move === null) return 'snapback';
+
+            moveHistory.push(move.san);
+            updateMoveHistory();
+
+            if (game.game_over()) {
+                gameOver = true;
+                gameResult = game.in_checkmate() ? (game.turn() === 'w' ? 'Black Wins' : 'White Wins') : 'Draw';
+                updateStatus();
+                return;
+            }
+
+            updateStatus();
+            document.getElementById('ai-suggestions').innerHTML = ''; // Clear suggestions after player move
+            setTimeout(makeAIMove, 250);
+        }
+
+        function onSnapEnd() {
+            board.position(game.fen());
+        }
+
+        // AI move generation with visualization
+        async function makeAIMove() {
+            if (gameOver) return;
+
+            const inputSeq = moveHistory.map(move => moveToIdx[move] || moveToIdx['e4'] || 1);
+            const maxSeqLength = 10;
+            while (inputSeq.length < maxSeqLength) inputSeq.push(moveToIdx['<PAD>']);
+            if (inputSeq.length > maxSeqLength) inputSeq.splice(0, inputSeq.length - maxSeqLength);
+
+            const inputTensor = new ort.Tensor('int64', BigInt64Array.from(inputSeq.map(BigInt)), [1, maxSeqLength]);
+
+            try {
+                const feeds = { input: inputTensor };
+                const output = await session.run(feeds);
+
+                const pi = output.pi.data; // [1, 10, 5]
+                const distribution = output.distribution.data; // [1, 10, 5, 1868]
+
+                const piLast = Array.from(pi.slice(45, 50)); // Last timestep
+                const distLast = Array.from(distribution.slice(9340, 18680));
+
+                const vocabSize = 1868;
+                const moveProbabilities = new Array(vocabSize).fill(0);
+                for (let i = 0; i < 5; i++) {
+                    for (let j = 0; j < vocabSize; j++) {
+                        moveProbabilities[j] += piLast[i] * distLast[i * vocabSize + j];
+                    }
+                }
+
+                const legalMoves = game.moves();
+                const legalMoveStrs = legalMoves.map(move => move.replace(/\+/g, '').replace(/#/g, ''));
+
+                // Compute total probability of legal moves for renormalization
+                let totalLegalProb = 0;
+                const legalMoveProbs = [];
+                for (let j = 0; j < vocabSize; j++) {
+                    const move = idxToMove[j.toString()];
+                    if (move && move !== '<PAD>' && legalMoveStrs.includes(move)) {
+                        totalLegalProb += moveProbabilities[j];
+                        legalMoveProbs.push({ move, prob: moveProbabilities[j], idx: j });
+                    }
+                }
+
+                // Renormalize probabilities over legal moves
+                const normalizedProbs = legalMoveProbs.map(item => ({
+                    move: item.move,
+                    prob: totalLegalProb > 0 ? item.prob / totalLegalProb : 0,
+                    idx: item.idx
+                }));
+
+                // Get top 3 legal moves with highest normalized probabilities
+                const topNMoves = [];
+                const N = 3;
+                normalizedProbs.sort((a, b) => b.prob - a.prob);
+                for (let i = 0; i < Math.min(N, normalizedProbs.length); i++) {
+                    topNMoves.push({ move: normalizedProbs[i].move, prob: normalizedProbs[i].prob });
+                }
+
+                // Display top N moves in the UI
+                const suggestionsDiv = document.getElementById('ai-suggestions');
+                suggestionsDiv.innerHTML = '<h3>Top AI Suggestions:</h3>';
+                topNMoves.forEach((item, index) => {
+                    suggestionsDiv.innerHTML += `<p>${index + 1}. ${item.move} (${(item.prob * 100).toFixed(2)}%)</p>`;
+                });
+
+                // Select and make the best move
+                let bestMove = topNMoves[0]?.move || legalMoves[Math.floor(Math.random() * legalMoves.length)];
+                const move = game.move(bestMove);
+                moveHistory.push(move.san);
+                updateMoveHistory();
+                board.position(game.fen());
+
+                if (game.game_over()) {
+                    gameOver = true;
+                    gameResult = game.in_checkmate() ? (game.turn() === 'w' ? 'Black Wins' : 'White Wins') : 'Draw';
+                }
+
+                updateStatus();
+            } catch (error) {
+                console.error('Inference error:', error);
+                const legalMoves = game.moves();
+                if (legalMoves.length) {
+                    const move = game.move(legalMoves[Math.floor(Math.random() * legalMoves.length)]);
+                    moveHistory.push(move.san);
+                    updateMoveHistory();
+                    board.position(game.fen());
+                    if (game.game_over()) {
+                        gameOver = true;
+                        gameResult = game.in_checkmate() ? (game.turn() === 'w' ? 'Black Wins' : 'White Wins') : 'Draw';
+                    }
+                    updateStatus();
+                }
+            }
+        }
+
+        // Update UI functions
+        function updateStatus() {
+            document.getElementById('game-status').innerText = gameOver 
+                ? `Game Over: ${gameResult}` 
+                : (game.turn() === playerColor ? 'Your Turn' : 'AI Thinking...');
+        }
+
+        function updateMoveHistory() {
+            const historyDiv = document.getElementById('move-history');
+            historyDiv.innerHTML = '';
+            for (let i = 0; i < moveHistory.length; i += 2) {
+                const moveNumber = (i / 2) + 1;
+                const whiteMove = moveHistory[i];
+                const blackMove = moveHistory[i + 1] || '';
+                historyDiv.innerHTML += `${moveNumber}. ${whiteMove} ${blackMove}<br>`;
+            }
+            historyDiv.scrollTop = historyDiv.scrollHeight;
+        }
+
+        // Button handlers
+        document.getElementById('new-game').addEventListener('click', () => {
+            game = new Chess();
+            board.position('start');
+            moveHistory = [];
+            gameOver = false;
+            gameResult = null;
+            updateMoveHistory();
+            updateStatus();
+            document.getElementById('ai-suggestions').innerHTML = '';
+            if (playerColor === 'b') makeAIMove();
+        });
+
+        document.getElementById('flip-board').addEventListener('click', () => {
+            playerColor = playerColor === 'w' ? 'b' : 'w';
+            board.orientation(playerColor === 'w' ? 'white' : 'black');
+            game = new Chess();
+            board.position('start');
+            moveHistory = [];
+            gameOver = false;
+            gameResult = null;
+            updateMoveHistory();
+            updateStatus();
+            document.getElementById('ai-suggestions').innerHTML = '';
+            if (playerColor === 'b') makeAIMove();
+        });
+    </script>
+</body>
+</html>
