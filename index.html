@@ -162,24 +162,24 @@
         // AI move generation with visualization
         async function makeAIMove() {
             if (gameOver) return;
-
+        
             const inputSeq = moveHistory.map(move => moveToIdx[move] || moveToIdx['e4'] || 1);
             const maxSeqLength = 10;
             while (inputSeq.length < maxSeqLength) inputSeq.push(moveToIdx['<PAD>']);
             if (inputSeq.length > maxSeqLength) inputSeq.splice(0, inputSeq.length - maxSeqLength);
-
+        
             const inputTensor = new ort.Tensor('int64', BigInt64Array.from(inputSeq.map(BigInt)), [1, maxSeqLength]);
-
+        
             try {
                 const feeds = { input: inputTensor };
                 const output = await session.run(feeds);
-
-                const pi = output.pi.data; // [1, 10, 5]
-                const distribution = output.distribution.data; // [1, 10, 5, 1868]
-
-                const piLast = Array.from(pi.slice(45, 50)); // Last timestep
+        
+                const pi = output.pi.data;
+                const distribution = output.distribution.data;
+        
+                const piLast = Array.from(pi.slice(45, 50));
                 const distLast = Array.from(distribution.slice(9340, 18680));
-
+        
                 const vocabSize = 1868;
                 const moveProbabilities = new Array(vocabSize).fill(0);
                 for (let i = 0; i < 5; i++) {
@@ -187,10 +187,18 @@
                         moveProbabilities[j] += piLast[i] * distLast[i * vocabSize + j];
                     }
                 }
-
+        
                 const legalMoves = game.moves();
                 const legalMoveStrs = legalMoves.map(move => move.replace(/\+/g, '').replace(/#/g, ''));
-
+        
+                // Get top 3 suggestions (including illegal moves) from raw probabilities
+                const allMovesProbs = moveProbabilities.map((prob, idx) => ({
+                    prob,
+                    move: idxToMove[idx.toString()]
+                })).filter(item => item.move && item.move !== '<PAD>');
+                allMovesProbs.sort((a, b) => b.prob - a.prob);
+                const topAllMoves = allMovesProbs.slice(0, 3);
+        
                 // Compute total probability of legal moves for renormalization
                 let totalLegalProb = 0;
                 const legalMoveProbs = [];
@@ -201,14 +209,14 @@
                         legalMoveProbs.push({ move, prob: moveProbabilities[j], idx: j });
                     }
                 }
-
+        
                 // Renormalize probabilities over legal moves
                 const normalizedProbs = legalMoveProbs.map(item => ({
                     move: item.move,
                     prob: totalLegalProb > 0 ? item.prob / totalLegalProb : 0,
                     idx: item.idx
                 }));
-
+        
                 // Get top 3 legal moves with highest normalized probabilities
                 const topNMoves = [];
                 const N = 3;
@@ -216,35 +224,51 @@
                 for (let i = 0; i < Math.min(N, normalizedProbs.length); i++) {
                     topNMoves.push({ move: normalizedProbs[i].move, prob: normalizedProbs[i].prob });
                 }
-
-                // Display top N moves in the UI
+        
+                // Select the best move
+                let bestMove = topNMoves[0]?.move || legalMoves[Math.floor(Math.random() * legalMoves.length)];
+                const isFallback = topNMoves.length === 0;
+        
+                // Display suggestions and selected move
                 const suggestionsDiv = document.getElementById('ai-suggestions');
                 suggestionsDiv.innerHTML = '<h3>Top AI Suggestions:</h3>';
-                topNMoves.forEach((item, index) => {
-                    suggestionsDiv.innerHTML += `<p>${index + 1}. ${item.move} (${(item.prob * 100).toFixed(2)}%)</p>`;
+                topAllMoves.forEach((item, index) => {
+                    const isLegal = legalMoveStrs.includes(item.move);
+                    let text = `${index + 1}. ${item.move} (${(item.prob * 100).toFixed(2)}%)`;
+                    if (!isLegal) {
+                        text += ' <span style="color: red;">(illegal)</span>';
+                    } else if (item.move === bestMove && !isFallback) {
+                        text += ' <span style="color: green;">(selected)</span>';
+                    }
+                    suggestionsDiv.innerHTML += `<p>${text}</p>`;
                 });
-
-                // Select and make the best move
-                let bestMove = topNMoves[0]?.move || legalMoves[Math.floor(Math.random() * legalMoves.length)];
+                if (isFallback) {
+                    suggestionsDiv.innerHTML += '<p style="color: orange;">No legal suggestions from model. Selected random move: ' + bestMove + '</p>';
+                }
+        
+                // Make the move
                 const move = game.move(bestMove);
                 moveHistory.push(move.san);
                 updateMoveHistory();
                 board.position(game.fen());
-
+        
                 if (game.game_over()) {
                     gameOver = true;
                     gameResult = game.in_checkmate() ? (game.turn() === 'w' ? 'Black Wins' : 'White Wins') : 'Draw';
                 }
-
+        
                 updateStatus();
             } catch (error) {
                 console.error('Inference error:', error);
                 const legalMoves = game.moves();
                 if (legalMoves.length) {
-                    const move = game.move(legalMoves[Math.floor(Math.random() * legalMoves.length)]);
+                    const bestMove = legalMoves[Math.floor(Math.random() * legalMoves.length)];
+                    const move = game.move(bestMove);
                     moveHistory.push(move.san);
                     updateMoveHistory();
                     board.position(game.fen());
+                    const suggestionsDiv = document.getElementById('ai-suggestions');
+                    suggestionsDiv.innerHTML = '<p style="color: orange;">Model error. Selected random move: ' + bestMove + '</p>';
                     if (game.game_over()) {
                         gameOver = true;
                         gameResult = game.in_checkmate() ? (game.turn() === 'w' ? 'Black Wins' : 'White Wins') : 'Draw';
